@@ -1,0 +1,10 @@
+- insert:
+    - id: win32-cua
+      name: 'dsh-win-cua'
+      config:
+        humanize: true
+        keepScreenshots: 30
+        zoomFactor: 2
+        maxWaitMs: 10000
+        allowLaunch: true
+

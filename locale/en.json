@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Win32 Computer Use",
+    "description": "Real mouse and keyboard control plus screen capture on Windows, through Win32 SendInput and GDI BitBlt. No external driver."
+  }
+}

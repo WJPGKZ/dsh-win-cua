@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Win32 电脑操作",
+    "description": "用 Win32 的 SendInput 和 GDI BitBlt 在 Windows 上真实移动鼠标、点击、敲键盘和截屏，不需要任何外部驱动。"
+  }
+}
