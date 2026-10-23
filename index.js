@@ -11,12 +11,13 @@
  */
 import { deflateSync } from 'node:zlib';
 import { createRequire } from 'node:module';
-import { mkdirSync, writeFileSync, readdirSync, unlinkSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readdirSync, unlinkSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const SCREEN_DIR = join(tmpdir(), 'dsh-cua-screens');
+const CAPTURE_PREFIXES = ['screen-', 'window-', 'zoom-'];
 
 /**
  * Resolve koffi from wherever this profile keeps its packages. A bundle installed by
@@ -137,8 +138,10 @@ const MOUSEEVENTF_MIDDLEDOWN = 0x0020;
 const MOUSEEVENTF_MIDDLEUP = 0x0040;
 const MOUSEEVENTF_WHEEL = 0x0800;
 const MOUSEEVENTF_ABSOLUTE = 0x8000;
+const MOUSEEVENTF_VIRTUALDESK = 0x4000;
 const KEYEVENTF_KEYUP = 0x0002;
 const KEYEVENTF_UNICODE = 0x0004;
+const KEYEVENTF_EXTENDEDKEY = 0x0001;
 const MAX_COORD = 65535;
 const SW_RESTORE = 9;
 const MOUSEEVENTF_HWHEEL = 0x01000;
@@ -161,7 +164,12 @@ const DEFAULTS = {
 const CFG = { ...DEFAULTS };
 
 const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
-const between = ([min, max]) => min + Math.random() * Math.max(0, max - min);
+const between = (range) => {
+  const pair = Array.isArray(range) ? range : [Number(range) || 0, Number(range) || 0];
+  const min = Number(pair[0]) || 0;
+  const max = Number(pair[1] ?? min) || 0;
+  return min + Math.random() * Math.max(0, max - min);
+};
 
 /**
  * Raw `tools.register()` does not validate arguments the way `defineTool` does,
@@ -271,6 +279,8 @@ function captureRect(A, sx, sy, width, height) {
     if (!A.BitBlt(memDc, 0, 0, w, h, srcDc, left, top, SRCCOPY | CAPTUREBLT)) {
       throw new Error('BitBlt failed');
     }
+    // GetDIBits requires the bitmap to be selected out of the DC.
+    A.SelectObject(memDc, old);
     return readBits(A, memDc, bmp, w, h);
   } finally {
     A.SelectObject(memDc, old);
@@ -316,6 +326,7 @@ function captureWindow(A, hwnd) {
         A.ReleaseDC(null, screenDc);
       }
     }
+    A.SelectObject(memDc, old);
     return { ...readBits(A, memDc, bmp, width, height), bounds, printed: Boolean(printed) };
   } finally {
     A.SelectObject(memDc, old);
@@ -467,21 +478,44 @@ function resolveKey(name) {
   throw new Error(`unknown key: ${name}`);
 }
 
+/** Virtual keys that live on the "extended" part of the keyboard. */
+const EXTENDED_KEYS = new Set([
+  0x2d, // insert
+  0x2e, // delete
+  0x24, // home
+  0x23, // end
+  0x21, // page up
+  0x22, // page down
+  0x25, // left
+  0x26, // up
+  0x27, // right
+  0x28, // down
+  0x5b, // win
+  0x90, // num lock
+  0x2c, // print screen
+]);
+
 /** Tap one key, optionally with modifiers held. */
 function tapKey(A, key, modifiers = []) {
   const mods = modifiers.map(resolveKey);
   for (const code of mods) sendInput(A, keyInput(code, 0));
   const code = resolveKey(key);
-  sendInput(A, keyInput(code, 0));
-  sendInput(A, keyInput(code, KEYEVENTF_KEYUP));
+  // Arrows/navigation keys need EXTENDEDKEY or apps that read scan codes see the keypad.
+  const extended = EXTENDED_KEYS.has(code) ? KEYEVENTF_EXTENDEDKEY : 0;
+  sendInput(A, keyInput(code, extended));
+  sendInput(A, keyInput(code, extended | KEYEVENTF_KEYUP));
   for (const mod of mods.reverse()) sendInput(A, keyInput(mod, KEYEVENTF_KEYUP));
 }
 
 /** Type literal text through unicode keyboard events at a human cadence. */
 async function typeText(A, text, humanize) {
-  for (const char of String(text)) {
+  const chars = [...String(text)];
+  for (let i = 0; i < chars.length; i += 1) {
+    const char = chars[i];
     const code = char.codePointAt(0);
     if (code === undefined) continue;
+    // "\r\n" must produce one Enter, not two.
+    if (code === 13 && chars[i + 1] === '\n') continue;
     if (code === 10 || code === 13) {
       sendInput(A, keyInput(0x0d, 0));
       sendInput(A, keyInput(0x0d, KEYEVENTF_KEYUP));
@@ -500,7 +534,12 @@ async function typeText(A, text, humanize) {
 /** Move the pointer to a screen pixel. */
 function moveMouse(A, x, y) {
   const { ax, ay } = toAbsolute(A, Math.round(x), Math.round(y));
-  sendInput(A, mouseInput({ dx: ax, dy: ay, flags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE }));
+  // VIRTUALDESK is required, otherwise absolute coordinates are mapped onto the
+  // primary monitor only and a second display can never be reached.
+  sendInput(A, mouseInput({
+    dx: ax, dy: ay,
+    flags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+  }));
 }
 
 /**
@@ -542,12 +581,13 @@ function clickMouse(A, button = 'left', double = false) {
   }
 }
 
-/** Scroll the wheel; positive is up (or right on the horizontal axis). */
+/** Scroll the wheel; positive is up (or right on the horizontal axis). Returns the signed delta. */
 function scrollWheel(A, amount, axis = 'vertical') {
   const delta = Math.round(requireNumber(amount, 'amount'));
-  if (!delta) return;
+  if (!delta) return 0;
   const flag = String(axis).toLowerCase() === 'horizontal' ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL;
   sendInput(A, mouseInput({ data: delta, flags: flag }));
+  return delta;
 }
 
 /** Encode one frame to PNG on disk, then prune old captures. */
@@ -572,7 +612,7 @@ function pruneScreens(directory) {
   if (!Number.isFinite(keep) || keep <= 0) return;
   try {
     const names = readdirSync(directory)
-      .filter((name) => name.startsWith('screen-') && name.endsWith('.png'))
+      .filter((name) => CAPTURE_PREFIXES.some((prefix) => name.startsWith(prefix)) && name.endsWith('.png'))
       .sort();
     for (const name of names.slice(0, Math.max(0, names.length - keep))) {
       try {
@@ -654,21 +694,47 @@ async function waitFor(A, { ms, title, timeoutMs }) {
   return { waitedMs: Date.now() - started, matched: false, timedOut: true };
 }
 
+/** True when the path exists and is a regular file (not a directory). */
+function isFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** Resolve an executable name or path without ever going through a shell. */
 function resolveExe(name) {
   const raw = String(name || '').trim();
   if (!raw) throw new Error('empty executable name');
   if (/[\\/]/.test(raw)) {
-    if (!existsSync(raw)) throw new Error(`executable not found: ${raw}`);
+    if (!isFile(raw)) throw new Error(`not an executable file: ${raw}`);
     return raw;
   }
   const exe = raw.toLowerCase().endsWith('.exe') ? raw : `${raw}.exe`;
   const dirs = (process.env.PATH || '').split(';').filter(Boolean);
   for (const dir of dirs) {
     const candidate = join(dir, exe);
-    if (existsSync(candidate)) return candidate;
+    if (isFile(candidate)) return candidate;
   }
   throw new Error(`executable not found on PATH: ${raw} (pass an absolute path instead)`);
+}
+
+/**
+ * Spawn an executable and wait until the OS confirms the process started.
+ * `spawn` reports failures asynchronously through an 'error' event; without this
+ * listener a bad path or a refused launch would crash the host process.
+ */
+async function launchApp(args) {
+  const exe = resolveExe(args.exe);
+  const argv = Array.isArray(args.args) ? args.args.map(String) : [];
+  const child = spawn(exe, argv, { detached: true, stdio: 'ignore', windowsHide: false });
+  await new Promise((resolve, reject) => {
+    child.once('spawn', resolve);
+    child.once('error', reject);
+  });
+  child.unref();
+  return { ok: true, exe, pid: child.pid ?? 0 };
 }
 
 /**
@@ -793,12 +859,16 @@ const TOOL_DECLS = [
       axis: { type: 'string', enum: ['vertical', 'horizontal'], description: 'Scroll axis; defaults to vertical.' },
     }, ['amount']),
     run: (A, args) => {
-      scrollWheel(A, args.amount, args.axis);
-      return { ok: true };
+      const amount = scrollWheel(A, args.amount, args.axis);
+      return { ok: true, amount, axis: String(args.axis || 'vertical').toLowerCase() };
     },
     out: {
-      schema: obj({ ok: bool('Always true.') }),
-      render: (_args, v) => text(`Wheel scrolled (${v.ok ? 'sent' : 'failed'}).`),
+      schema: obj({
+        ok: bool('Always true.'),
+        amount: { type: 'integer', description: 'Signed wheel delta that was sent (0 when amount was 0).' },
+        axis: str('Axis that was used.'),
+      }),
+      render: (_args, v) => text(`Wheel scrolled ${v.amount} (${v.axis}).`),
     },
   },
   {
@@ -856,15 +926,26 @@ const TOOL_DECLS = [
       handle: num('Window handle from cua_windows.'),
     }, ['handle']),
     run: (A, args) => {
-      const hwnd = A.koffi.address(requireNumber(args.handle, 'handle'));
+      const handle = requireNumber(args.handle, 'handle');
+      const hwnd = A.koffi.address(handle);
       A.ShowWindow(hwnd, SW_RESTORE);
-      A.SetForegroundWindow(hwnd);
       A.BringWindowToTop(hwnd);
-      return { ok: true, handle: args.handle };
+      A.SetForegroundWindow(hwnd);
+      // SetForegroundWindow can be refused by the foreground lock; report what happened
+      // instead of claiming success and letting the model type into the wrong window.
+      const active = Number(A.koffi.address(A.GetForegroundWindow())) === Math.trunc(handle);
+      return { ok: active, handle, active };
     },
     out: {
-      schema: obj({ ok: bool('Always true.'), handle: num('Focused window handle.') }),
-      render: (_args, v) => text(`Window ${v.handle} brought to the foreground.`),
+      schema: obj({
+        ok: bool('True when the window actually holds the foreground.'),
+        handle: num('Focused window handle.'),
+        active: bool('Whether it is the foreground window after the call.'),
+      }),
+      render: (_args, v) => text(
+        v.active
+          ? `Window ${v.handle} is in the foreground.`
+          : `Window ${v.handle} was restored but did NOT take the foreground (Windows foreground lock?).`),
     },
   },
   {
@@ -896,10 +977,14 @@ const TOOL_DECLS = [
     }, ['x', 'y', 'width', 'height']),
     run: (A, args) => {
       const screen = virtualScreen(A);
-      const x = Math.max(screen.x, Math.round(args.x));
-      const y = Math.max(screen.y, Math.round(args.y));
-      const right = Math.min(screen.x + screen.width, Math.round(args.x + args.width));
-      const bottom = Math.min(screen.y + screen.height, Math.round(args.y + args.height));
+      const reqX = requireNumber(args.x, 'x');
+      const reqY = requireNumber(args.y, 'y');
+      const reqW = requireNumber(args.width, 'width');
+      const reqH = requireNumber(args.height, 'height');
+      const x = Math.max(screen.x, Math.round(reqX));
+      const y = Math.max(screen.y, Math.round(reqY));
+      const right = Math.min(screen.x + screen.width, Math.round(reqX + reqW));
+      const bottom = Math.min(screen.y + screen.height, Math.round(reqY + reqH));
       const w = right - x;
       const h = bottom - y;
       if (w <= 0 || h <= 0) throw new Error('zoom region falls outside the virtual screen');
@@ -996,7 +1081,7 @@ const TOOL_DECLS = [
             : `Waited ${v.waitedMs} ms.`),
     },
     readOnly: true,
-    timeoutMs: 15_000,
+    timeoutMs: 60_000,
   },
   {
     name: 'cua_app_list',
@@ -1039,11 +1124,7 @@ const TOOL_DECLS = [
     }, ['exe']),
     run: (A, args) => {
       if (CFG.allowLaunch !== true) throw new Error('cua_app_launch is disabled by config (allowLaunch: false)');
-      const exe = resolveExe(args.exe);
-      const argv = Array.isArray(args.args) ? args.args.map(String) : [];
-      const child = spawn(exe, argv, { detached: true, stdio: 'ignore', windowsHide: false });
-      child.unref();
-      return { ok: true, exe, pid: child.pid ?? 0 };
+      return launchApp(args);
     },
     out: {
       schema: obj({
@@ -1073,10 +1154,38 @@ export const inject = ['tools'];
  * - `maxWaitMs` (default 10000): ceiling for `cua_wait`.
  * - `allowLaunch` (default true): set false to disable `cua_app_launch`.
  */
+/**
+ * Coerce the bundle config into the shapes the code expects. A YAML author will
+ * naturally write `keyDelayMs: 20` instead of `[12, 34]`, and a string where a
+ * number belongs — normalize once here instead of throwing deep inside a tool.
+ */
+function normalizeConfig(raw = {}) {
+  const finite = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+  const range = (value, fallback) => {
+    if (Array.isArray(value) && value.length >= 2) {
+      const low = Number(value[0]);
+      const high = Number(value[1]);
+      if (Number.isFinite(low) && Number.isFinite(high)) return [low, Math.max(low, high)];
+    } else if (Number.isFinite(Number(value))) {
+      return [Number(value), Number(value)];
+    }
+    return fallback;
+  };
+  return {
+    humanize: raw.humanize === undefined ? DEFAULTS.humanize : Boolean(raw.humanize),
+    keepScreenshots: finite(raw.keepScreenshots, DEFAULTS.keepScreenshots),
+    moveSteps: finite(raw.moveSteps, DEFAULTS.moveSteps),
+    keyDelayMs: range(raw.keyDelayMs, DEFAULTS.keyDelayMs),
+    clickSettleMs: range(raw.clickSettleMs, DEFAULTS.clickSettleMs),
+    zoomFactor: finite(raw.zoomFactor, DEFAULTS.zoomFactor),
+    zoomMaxPixels: finite(raw.zoomMaxPixels, DEFAULTS.zoomMaxPixels),
+    maxWaitMs: finite(raw.maxWaitMs, DEFAULTS.maxWaitMs),
+    allowLaunch: raw.allowLaunch === undefined ? DEFAULTS.allowLaunch : Boolean(raw.allowLaunch),
+  };
+}
+
 export function apply(ctx, config = {}) {
-  for (const key of Object.keys(DEFAULTS)) {
-    if (config[key] !== undefined) CFG[key] = config[key];
-  }
+  Object.assign(CFG, normalizeConfig(config));
   for (const decl of TOOL_DECLS) {
     const tool = {
       name: decl.name,

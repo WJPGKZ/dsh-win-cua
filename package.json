@@ -1,9 +1,10 @@
 {
   "name": "dsh-win-cua",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Windows computer-use for DSH: real mouse and keyboard input through Win32 SendInput, screen capture through GDI BitBlt, window control. No external driver.",
   "type": "module",
   "main": "index.js",
+  "icon": "./icon.svg",
   "license": "MIT",
   "author": "WJPGKZ",
   "homepage": "https://github.com/WJPGKZ/dsh-win-cua#readme",
@@ -15,7 +16,7 @@
     "url": "https://github.com/WJPGKZ/dsh-win-cua/issues"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.11"
   },
   "keywords": [
     "dsh",
@@ -41,7 +42,7 @@
       "patch": "cordis.patch.yml"
     },
     "compatibility": {
-      "node": ">=20"
+      "node": ">=20.11"
     }
   }
 }

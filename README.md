@@ -15,7 +15,9 @@ capture, with no external driver.
 | DPI | `SetProcessDpiAwarenessContext(-4)` — per-monitor v2 |
 
 FFI is [koffi](https://www.npmjs.com/package/koffi). Coordinates are physical pixels of
-the virtual screen; the primary display's top-left is `(0, 0)`.
+the virtual screen; the primary display's top-left is `(0, 0)`. Absolute pointer moves use
+`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`, so displays left/right/above the primary
+one are reachable too.
 
 ## Tools
 
@@ -63,6 +65,9 @@ Set in this bundle's `cordis.patch.yml` under `config`:
 Pointer targets are clamped into the virtual screen, and astral code points (emoji,
 CJK extension B) are sent as surrogate pairs so `KEYEVENTF_UNICODE` types them correctly.
 
+`allowLaunch` lets the model start any program the host process can run; set it to `false`
+when the session is not trusted.
+
 ## No external driver
 
 Unlike `dsh-computer-use` (which shells out to the `cua-driver` binary) this plugin calls
@@ -91,6 +96,22 @@ Windows only. `SendInput` injects into the session whose input queue is active �
 on a locked or disconnected desktop receives nothing.
 
 ## Changelog
+
+### 0.2.1
+
+- Fixed: absolute pointer coordinates now carry `MOUSEEVENTF_VIRTUALDESK`; without it a
+  multi-monitor desktop silently mapped every move/click/drag onto the primary display.
+- Fixed: `cua_app_launch` no longer crashes the host when the target is a directory or the
+  launch is refused — it waits for the OS to confirm the process started and rejects cleanly.
+- `GetDIBits` is called with the bitmap selected out of the DC, as the API requires.
+- `keepScreenshots` now rotates `window-*` and `zoom-*` captures too.
+- `cua_focus_window` reports whether the window actually took the foreground instead of
+  always returning `ok: true`.
+- Arrow/navigation keys are sent with `KEYEVENTF_EXTENDEDKEY`.
+- Config values are normalized: `keyDelayMs: 20` (a number) works the same as `[20, 20]`.
+- `cua_type` sends one Enter for `"\r\n"`; `cua_zoom` coerces string coordinates safely;
+  `cua_scroll` reports the delta it sent.
+- `package.json` gained `icon`, `repository`, `bugs`, `homepage` and a `>=20.11` engine range.
 
 ### 0.2.0
 
